@@ -1,7 +1,7 @@
 # Posture Analyzer — Gym Tracker
 
 A real-time posture analysis and gym tracking tool built with Python, MediaPipe, and OpenCV.  
-Originally based on a Linear Algebra mini-project by **Vanshika Aneja & Advika Mathur** using dot product vector math to calculate joint angles.
+
 
 ---
 
