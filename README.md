@@ -1,6 +1,8 @@
 # Posture Analyzer — Gym Tracker
 
 A real-time posture analysis and gym tracking tool built with Python, MediaPipe, and OpenCV.  
+
+
 ---
 
 ## What this project does
