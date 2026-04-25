@@ -1,3 +1,4 @@
+import argparse
 import cv2
 import mediapipe as mp
 import time
@@ -11,10 +12,7 @@ def get_coords(landmarks, idx, w, h):
     lm = landmarks[idx]
     return (int(lm.x * w), int(lm.y * h))
 
-cap = cv2.VideoCapture(0)
-
 # ── exercise list for GYM mode ──────────────────────────────────────────────
-# Each entry: display name shown in the UI
 GYM_EXERCISES = [
     "SQUATS",
     "PUSH UPS",
@@ -27,15 +25,21 @@ GYM_EXERCISES = [
     "SHOULDER PRESS",
     "DEADLIFT",
 ]
-exercise_idx = 0   # index into GYM_EXERCISES
+
+# ── CLI arguments (passed by launcher.py) ────────────────────────────────────
+_parser = argparse.ArgumentParser(description="Posture Analyzer")
+_parser.add_argument("--mode",     default="GYM",    choices=["GYM", "SITTING"])
+_parser.add_argument("--exercise", default="SQUATS", choices=GYM_EXERCISES)
+_args = _parser.parse_args()
 
 # ── state variables ──────────────────────────────────────────────────────────
 bad_start    = None
 reps         = 0
 stage        = None
-mode         = "GYM"       # "GYM" or "SITTING"
-hunch_start  = None        # timer for sitting hunch alert
-plank_start  = None        # timer for plank hold duration
+mode         = _args.mode
+exercise_idx = GYM_EXERCISES.index(_args.exercise) if _args.mode == "GYM" else 0
+hunch_start  = None
+plank_start  = None
 
 
 def draw_info_panel(frame, exercise, label, color, angle_lines,
@@ -82,12 +86,36 @@ def draw_info_panel(frame, exercise, label, color, angle_lines,
                         1.2, (0, 0, 255), 3)
 
 
+def open_camera():
+    """
+    Try camera indices 0, 1, 2 in order.
+    Returns an opened VideoCapture or raises SystemExit.
+    """
+    for idx in range(3):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"[INFO] Camera opened at index {idx}")
+                return cap
+            cap.release()
+    print("[ERROR] No webcam found on indices 0, 1, or 2.")
+    print("        Make sure your camera is connected and not used by another app.")
+    print("        On macOS: check System Settings → Privacy & Security → Camera")
+    raise SystemExit(1)
+
+
 with mp_pose.Pose(min_detection_confidence=0.6,
                   min_tracking_confidence=0.6) as pose:
+
+    cap = open_camera()
+
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret or frame is None:
+            print("[WARNING] Failed to grab frame. Retrying...")
+            time.sleep(0.05)
+            continue
 
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -109,25 +137,21 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                 exercise = GYM_EXERCISES[exercise_idx]
 
                 # ── SQUATS ───────────────────────────────────────────────────
-                # Dataset: knee p25=84 (DOWN), p75=177 (UP)
-                # Hip p10=39→p25=83 bottom, p75=173 standing
                 if exercise == "SQUATS":
-                    hip   = get_coords(lm, 24, w, h)   # right hip
-                    knee  = get_coords(lm, 26, w, h)   # right knee
-                    ankle = get_coords(lm, 28, w, h)   # right ankle
+                    hip   = get_coords(lm, 24, w, h)
+                    knee  = get_coords(lm, 26, w, h)
+                    ankle = get_coords(lm, 28, w, h)
                     r_shoulder = get_coords(lm, 12, w, h)
 
                     knee_angle = calculate_angle(hip, knee, ankle)
                     hip_angle  = calculate_angle(r_shoulder, hip, knee)
 
-                    # rep counting — knee drives the state machine
                     if knee_angle < 90:
                         stage = "DOWN"
                     if knee_angle > 160 and stage == "DOWN":
                         stage = "UP"
                         reps += 1
 
-                    # classify based on phase
                     joint_key = "squat_knee_down" if stage == "DOWN" else "squat_knee_up"
                     label, color = classify_posture(knee_angle, joint_key)
                     score = get_multi_joint_score((knee_angle, 90), (hip_angle, 170))
@@ -144,8 +168,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── PUSH UPS ─────────────────────────────────────────────────
-                # Dataset: elbow p25=83 (DOWN), p75=169 (UP)
-                # Hip (plank alignment) p25=155, p50=167
                 elif exercise == "PUSH UPS":
                     l_shoulder = get_coords(lm, 11, w, h)
                     l_elbow    = get_coords(lm, 13, w, h)
@@ -165,7 +187,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     joint_key = "pushup_elbow_down" if stage == "DOWN" else "pushup_elbow_up"
                     label, color = classify_posture(elbow_angle, joint_key)
                     hip_label, _ = classify_posture(hip_angle, "pushup_hip")
-                    # override to bad if body is sagging/piking
                     if hip_label == "BAD POSTURE":
                         label, color = "BAD POSTURE — BODY SAG", (0, 0, 255)
                     score = get_multi_joint_score((elbow_angle, 90), (hip_angle, 170))
@@ -182,8 +203,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── PULL UPS ─────────────────────────────────────────────────
-                # Dataset: elbow p25=61 (chin up/top), p75=174 (dead hang/bottom)
-                # Shoulder stays raised: p50=151, p75=171
                 elif exercise == "PULL UPS":
                     l_shoulder = get_coords(lm, 11, w, h)
                     l_elbow    = get_coords(lm, 13, w, h)
@@ -193,7 +212,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     elbow_angle    = calculate_angle(l_shoulder, l_elbow, l_wrist)
                     shoulder_angle = calculate_angle(l_elbow, l_shoulder, l_hip)
 
-                    # rep: hang (elbow > 150) → pull up (elbow < 90)
                     if elbow_angle > 150:
                         stage = "HANG"
                     if elbow_angle < 90 and stage == "HANG":
@@ -219,8 +237,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── JUMPING JACKS ────────────────────────────────────────────
-                # Dataset: shoulder p25=14 (arms down), p75=147 (arms up)
-                # Elbow near straight throughout: p25=148, p50=167
                 elif exercise == "JUMPING JACKS":
                     l_elbow    = get_coords(lm, 13, w, h)
                     l_shoulder = get_coords(lm, 11, w, h)
@@ -230,7 +246,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     shoulder_angle = calculate_angle(l_elbow, l_shoulder, l_hip)
                     elbow_angle    = calculate_angle(l_shoulder, l_elbow, l_wrist)
 
-                    # rep: arms down (shoulder < 25) → arms up (shoulder > 130)
                     if shoulder_angle < 25:
                         stage = "DOWN"
                     if shoulder_angle > 130 and stage == "DOWN":
@@ -256,9 +271,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── RUSSIAN TWISTS ───────────────────────────────────────────
-                # Dataset: hip p10=28, p25=43, p50=52 (torso leaned back ~45°)
-                # Knee p25=71, p75=119 (bent throughout)
-                # Shoulder p25=9, p75=23 (arms tight to body)
                 elif exercise == "RUSSIAN TWISTS":
                     l_shoulder = get_coords(lm, 11, w, h)
                     l_hip      = get_coords(lm, 23, w, h)
@@ -270,8 +282,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     knee_angle     = calculate_angle(l_hip, l_knee, l_ankle)
                     shoulder_angle = calculate_angle(l_elbow, l_shoulder, l_hip)
 
-                    # rep: count each full side-to-side twist as 1 rep
-                    # proxy: shoulder angle crossing from small → mid → small
                     if shoulder_angle < 10:
                         if stage == "LEFT" or stage is None:
                             stage = "RIGHT"
@@ -302,8 +312,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── LUNGES ───────────────────────────────────────────────────
-                # Front knee ~90° at bottom, 165-180° standing
-                # Hip 85-120° at bottom (torso upright)
                 elif exercise == "LUNGES":
                     r_hip   = get_coords(lm, 24, w, h)
                     r_knee  = get_coords(lm, 26, w, h)
@@ -336,7 +344,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── PLANK ────────────────────────────────────────────────────
-                # Isometric hold — hip 160-180°, elbow 155-180°, knee 155-180°
                 elif exercise == "PLANK":
                     l_shoulder = get_coords(lm, 11, w, h)
                     l_elbow    = get_coords(lm, 13, w, h)
@@ -353,7 +360,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     elbow_label, _         = classify_posture(elbow_angle, "plank_elbow")
                     knee_label, _          = classify_posture(knee_angle, "plank_knee")
 
-                    # pick worst label to show
                     if "BAD" in hip_label:
                         label, color = hip_label, hip_color
                     elif "ADJUST" in hip_label:
@@ -361,7 +367,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     else:
                         label, color = "GOOD POSTURE", (0, 200, 0)
 
-                    # plank uses hold time not reps
                     if label == "GOOD POSTURE":
                         if plank_start is None:
                             plank_start = time.time()
@@ -388,9 +393,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── BICEP CURLS ──────────────────────────────────────────────
-                # UP: elbow 30-65° (fully curled)
-                # DOWN: elbow 155-180° (arm extended)
-                # Shoulder should stay still (0-30°)
                 elif exercise == "BICEP CURLS":
                     l_shoulder = get_coords(lm, 11, w, h)
                     l_elbow    = get_coords(lm, 13, w, h)
@@ -409,7 +411,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                     joint_key = "curl_elbow_up" if stage == "UP" else "curl_elbow_down"
                     label, color = classify_posture(elbow_angle, joint_key)
 
-                    # warn if shoulder swings
                     shoulder_label, _ = classify_posture(shoulder_angle, "curl_shoulder")
                     if shoulder_label == "BAD POSTURE":
                         label, color = "DON'T SWING", (0, 0, 255)
@@ -429,8 +430,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── SHOULDER PRESS ───────────────────────────────────────────
-                # DOWN: elbow 80-110° (weights at shoulders)
-                # UP: elbow 155-180° (arms locked overhead)
                 elif exercise == "SHOULDER PRESS":
                     l_elbow    = get_coords(lm, 13, w, h)
                     l_shoulder = get_coords(lm, 11, w, h)
@@ -463,8 +462,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                                     reps, stage, score, bad_start)
 
                 # ── DEADLIFT ─────────────────────────────────────────────────
-                # DOWN: hip 45-100° (hinge), knee 100-150° (slight bend)
-                # UP: hip 160-180° (standing lockout)
                 elif exercise == "DEADLIFT":
                     r_shoulder = get_coords(lm, 12, w, h)
                     r_hip      = get_coords(lm, 24, w, h)
@@ -510,7 +507,7 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                             0.5, (200, 200, 200), 1)
 
             # ════════════════════════════════════════════════════════════════
-            #   SITTING MODE (unchanged logic, kept intact)
+            #   SITTING MODE
             # ════════════════════════════════════════════════════════════════
             elif mode == "SITTING":
                 l_ear      = get_coords(lm, 7,  w, h)
@@ -597,7 +594,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
             break
 
         elif key == ord('s'):
-            # switch between GYM and SITTING mode
             if mode == "GYM":
                 mode = "SITTING"
                 hunch_start = None
@@ -609,7 +605,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
                 plank_start = None
 
         elif key == ord('a') and mode == "GYM":
-            # previous exercise
             exercise_idx = (exercise_idx - 1) % len(GYM_EXERCISES)
             reps = 0
             stage = None
@@ -617,7 +612,6 @@ with mp_pose.Pose(min_detection_confidence=0.6,
             plank_start = None
 
         elif key == ord('d') and mode == "GYM":
-            # next exercise
             exercise_idx = (exercise_idx + 1) % len(GYM_EXERCISES)
             reps = 0
             stage = None
@@ -625,10 +619,9 @@ with mp_pose.Pose(min_detection_confidence=0.6,
             plank_start = None
 
         elif key == ord('r') and mode == "GYM":
-            # reset reps and stage for current exercise
             reps = 0
             stage = None
             plank_start = None
 
-cap.release()
-cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()
